@@ -2,7 +2,11 @@ const express = require("express");
 const cors = require("cors");
 const path = require("path");
 const dotenv = require("dotenv");
+const session = require("express-session");
+const passport = require("passport");
+const SteamStrategy = require("passport-steam").Strategy;
 const { spawn } = require("child_process");
+const { getTrackerStats } = require("../scraper/tracker");
 
 dotenv.config({ path: path.join(__dirname, "..", ".env") });
 
@@ -12,11 +16,86 @@ if (!stripeSecretKey) {
   process.exit(1);
 }
 
+const steamApiKey = process.env.STEAM_API_KEY;
+if (!steamApiKey) {
+  console.error("Missing STEAM_API_KEY in .env");
+  process.exit(1);
+}
+
 const stripe = require("stripe")(stripeSecretKey);
 
 const app = express();
-app.use(cors({ origin: "http://localhost:5173" }));
+app.use(cors({ origin: "http://localhost:5173", credentials: true }));
 app.use(express.json());
+
+// ── Sessions ──
+app.use(
+  session({
+    secret: process.env.SESSION_SECRET || "safewager-dev-secret",
+    resave: false,
+    saveUninitialized: false,
+    cookie: {
+      maxAge: 24 * 60 * 60 * 1000, // 24 hours
+      httpOnly: true,
+      sameSite: "lax",
+      secure: false, // set true in production with HTTPS
+    },
+  })
+);
+
+// ── Passport / Steam OpenID ──
+passport.serializeUser((user, done) => done(null, user));
+passport.deserializeUser((user, done) => done(null, user));
+
+passport.use(
+  new SteamStrategy(
+    {
+      returnURL: "http://localhost:4242/auth/steam/return",
+      realm: "http://localhost:4242/",
+      apiKey: steamApiKey,
+    },
+    (_identifier, profile, done) => {
+      const user = {
+        steamId: profile.id,
+        username: profile.displayName,
+        avatar: profile.photos[2]?.value || profile.photos[0]?.value,
+        profileUrl: profile._json.profileurl,
+      };
+      console.log("[auth] Steam login:", user.username, user.steamId);
+      return done(null, user);
+    }
+  )
+);
+
+app.use(passport.initialize());
+app.use(passport.session());
+
+// ── Auth routes ──
+app.get("/auth/steam", passport.authenticate("steam"));
+
+app.get(
+  "/auth/steam/return",
+  passport.authenticate("steam", { failureRedirect: "http://localhost:5173/" }),
+  (_req, res) => {
+    res.redirect("http://localhost:5173/");
+  }
+);
+
+app.get("/auth/user", (req, res) => {
+  if (req.isAuthenticated()) {
+    res.json({ user: req.user });
+  } else {
+    res.json({ user: null });
+  }
+});
+
+app.post("/auth/logout", (req, res) => {
+  req.logout(() => {
+    req.session.destroy(() => {
+      res.json({ ok: true });
+    });
+  });
+});
 
 app.get("/health", (_req, res) => {
   res.json({ ok: true });
@@ -380,6 +459,127 @@ app.get("/match-result", (_req, res) => {
     return res.json({ resolved: false });
   }
   res.json({ resolved: true, ...matchResult });
+});
+
+// ── Integrity check state ──
+
+const integrityResults = {}; // { steamId: { stats, timestamp, passed } }
+const wagerHistory = []; // [{ id, creator, creatorSteamId, opponent, opponentSteamId, amount, map, result, timestamp }]
+
+const INTEGRITY_TTL = 24 * 60 * 60 * 1000; // 24 hours
+const CHEAT_THRESHOLD = 50; // percentage
+
+function getIntegrity(steamId) {
+  const entry = integrityResults[steamId];
+  if (!entry) return null;
+  const expired = Date.now() - entry.timestamp > INTEGRITY_TTL;
+  return { ...entry, expired };
+}
+
+// Run integrity check for the logged-in user.
+app.post("/integrity-check", async (req, res) => {
+  if (!req.isAuthenticated()) {
+    return res.status(401).json({ error: "not authenticated" });
+  }
+
+  const steamId = req.user.steamId;
+  console.log("[integrity] running check for", steamId);
+
+  try {
+    const stats = await getTrackerStats(steamId);
+    const cheatPct = parseInt(stats.cheating?.percentage) || 0;
+    const passed = cheatPct < CHEAT_THRESHOLD;
+
+    integrityResults[steamId] = {
+      stats,
+      timestamp: Date.now(),
+      passed,
+      cheatPct,
+    };
+
+    console.log("[integrity] done", { steamId, cheatPct, passed });
+    res.json({ stats, passed, cheatPct, timestamp: integrityResults[steamId].timestamp });
+  } catch (err) {
+    console.error("[integrity] error", err.message);
+    res.status(500).json({ error: "Integrity check failed: " + err.message });
+  }
+});
+
+// Get current integrity status for the logged-in user.
+app.get("/integrity-status", (req, res) => {
+  if (!req.isAuthenticated()) {
+    return res.status(401).json({ error: "not authenticated" });
+  }
+  const entry = getIntegrity(req.user.steamId);
+  if (!entry) {
+    return res.json({ checked: false });
+  }
+  res.json({ checked: true, ...entry });
+});
+
+// ── Wager storage (server-side) ──
+
+app.post("/create-wager", (req, res) => {
+  if (!req.isAuthenticated()) {
+    return res.status(401).json({ error: "not authenticated" });
+  }
+
+  const { amount, map } = req.body || {};
+  if (!amount || !map) {
+    return res.status(400).json({ error: "amount and map are required" });
+  }
+
+  // Check integrity
+  const integrity = getIntegrity(req.user.steamId);
+  if (!integrity || integrity.expired) {
+    return res.status(403).json({ error: "Integrity check required (expired or missing)" });
+  }
+  if (!integrity.passed) {
+    return res.status(403).json({ error: "Integrity check failed — cheating percentage too high" });
+  }
+
+  const wager = {
+    id: "w" + Date.now(),
+    creator: req.user.username,
+    creatorSteamId: req.user.steamId,
+    creatorAvatar: req.user.avatar,
+    amount,
+    map,
+    status: "open",
+    opponent: null,
+    opponentSteamId: null,
+    result: null,
+    timestamp: Date.now(),
+  };
+
+  wagerHistory.push(wager);
+  console.log("[wager] created", { id: wager.id, creator: wager.creator, amount, map });
+  res.json(wager);
+});
+
+// List all open wagers.
+app.get("/wagers", (_req, res) => {
+  res.json(wagerHistory.filter((w) => w.status === "open" || w.status === "in_progress"));
+});
+
+// Update wager result after match resolves.
+app.post("/wager-result", (req, res) => {
+  const { wagerId, winner, loser } = req.body || {};
+  const wager = wagerHistory.find((w) => w.id === wagerId);
+  if (!wager) return res.status(404).json({ error: "wager not found" });
+  wager.result = { winner, loser };
+  wager.status = "resolved";
+  res.json(wager);
+});
+
+// Get profile data for a user (integrity + wager history).
+app.get("/profile/:steamId", (req, res) => {
+  const { steamId } = req.params;
+  const integrity = getIntegrity(steamId);
+  const userWagers = wagerHistory.filter(
+    (w) => w.creatorSteamId === steamId || w.opponentSteamId === steamId
+  );
+  res.json({ integrity, wagers: userWagers });
 });
 
 const port = process.env.PORT || 4242;
