@@ -1,0 +1,17 @@
+@import url("https://fonts.googleapis.com/css2?family=Rajdhani:wght@400;500;600;700&family=Space+Grotesk:wght@400;500;600;700&display=swap");
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: "Space Grotesk", "Rajdhani", system-ui, -apple-system, sans-serif;
+  background: #0b0f14;
+  color: #e5e7eb;
+}
+
+button,
+input {
+  font-family: inherit;
+}
