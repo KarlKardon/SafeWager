@@ -1,5 +1,6 @@
 # Environment variables (Stripe keys)
 .env
+backend/data/
 
 # Dependencies
 node_modules/

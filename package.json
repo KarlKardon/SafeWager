@@ -1,0 +1,22 @@
+{
+  "name": "safewager",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "cs2-controller": "node cs2-controller/index.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/KarlKardon/SafeWager.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/KarlKardon/SafeWager/issues"
+  },
+  "homepage": "https://github.com/KarlKardon/SafeWager#readme"
+}
