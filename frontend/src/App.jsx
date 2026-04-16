@@ -307,9 +307,17 @@ function Dashboard({ user, onLogout }) {
     setServerInfo({ loading: true }); setMatchResult(null);
     const amountCents = Math.round(parseFloat(activeWager.amount.replace("$", "")) * 100);
     try {
-      const r = await fetch(`${API_URL}/start-match-server`, { method: "POST", headers: { "Content-Type": "application/json" }, credentials: "include", body: JSON.stringify({ playerAName: matchPlayers.a, playerBName: matchPlayers.b, wagerAmount: amountCents, map: activeWager?.map || "de_dust2" }) });
+      const r = await fetch(`${API_URL}/start-match-server`, { method: "POST", headers: { "Content-Type": "application/json" }, credentials: "include", body: JSON.stringify({ wagerId: activeWagerId, playerAName: matchPlayers.a, playerBName: matchPlayers.b, wagerAmount: amountCents, map: activeWager?.map || "de_dust2" }) });
+      const data = await r.json();
       if (!r.ok) throw new Error("Failed to start match server");
-      setServerInfo({ name: "sw-1v1-NA-042", status: "Match in progress", map: activeWager?.map || "de_dust2" });
+      setServerInfo({
+        name: data.slotId || "sw-na-slot-1",
+        status: data.status || "allocating_server",
+        map: activeWager?.map || "de_dust2",
+        serverIp: data.serverIp,
+        serverPort: data.serverPort,
+        serverPassword: data.serverPassword,
+      });
       setResultPolling(true);
       const poll = setInterval(async () => {
         try {
@@ -638,6 +646,8 @@ function Dashboard({ user, onLogout }) {
                       <div><p className="muted small">SERVER</p><h4>{serverInfo.name}</h4></div>
                       <div><p className="muted small">STATUS</p><h4>{serverInfo.status}</h4></div>
                       <div><p className="muted small">MAP</p><h4>{serverInfo.map}</h4></div>
+                      {serverInfo.serverIp && <div><p className="muted small">CONNECT</p><h4>{serverInfo.serverIp}:{serverInfo.serverPort}</h4></div>}
+                      {serverInfo.serverPassword && <div><p className="muted small">PASSWORD</p><h4>{serverInfo.serverPassword}</h4></div>}
                     </div>
                   )}
                   {serverInfo?.loading && <div className="muted center">Starting match server...</div>}

@@ -10,6 +10,8 @@ const { getTrackerStats } = require("../scraper/tracker");
 
 dotenv.config({ path: path.join(__dirname, "..", ".env") });
 
+const { db, dbPath, makeId, nowIso } = require("./db");
+
 const stripeSecretKey = process.env.SECRET_KEY;
 if (!stripeSecretKey) {
   console.error("Missing SECRET_KEY in .env");
@@ -23,6 +25,8 @@ if (!steamApiKey) {
 }
 
 const stripe = require("stripe")(stripeSecretKey);
+const controllerUrl = process.env.CS2_CONTROLLER_URL || "";
+const controllerToken = process.env.CS2_CONTROLLER_TOKEN || "";
 
 const app = express();
 app.use(cors({ origin: "http://localhost:5173", credentials: true }));
@@ -100,6 +104,116 @@ app.post("/auth/logout", (req, res) => {
 app.get("/health", (_req, res) => {
   res.json({ ok: true });
 });
+
+function formatCurrency(cents) {
+  return "$" + (cents / 100).toFixed(2);
+}
+
+function parseAmountToCents(amount) {
+  if (typeof amount === "number") return Math.round(amount);
+  if (typeof amount !== "string") return null;
+  const normalized = amount.replace(/[$,\s]/g, "");
+  const parsed = Number.parseFloat(normalized);
+  if (Number.isNaN(parsed) || parsed <= 0) return null;
+  return Math.round(parsed * 100);
+}
+
+function serializeWager(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    creator: row.creator_username,
+    creatorSteamId: row.creator_steam_id,
+    creatorAvatar: row.creator_avatar,
+    opponent: row.opponent_username,
+    opponentSteamId: row.opponent_steam_id,
+    amount: formatCurrency(row.amount_cents),
+    map: row.map,
+    status: row.status,
+    result:
+      row.winner_name && row.loser_name
+        ? { winner: row.winner_name, loser: row.loser_name }
+        : null,
+    timestamp: Date.parse(row.created_at),
+    matchId: row.match_id,
+  };
+}
+
+function serializeMatch(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    wagerId: row.wager_id,
+    playerAName: row.player_one_name,
+    playerBName: row.player_two_name,
+    status: row.status,
+    map: row.selected_map,
+    region: row.region,
+    serverSlotId: row.server_slot_id,
+    serverIp: row.server_ip,
+    serverPort: row.server_port,
+    serverPassword: row.server_password,
+    winner: row.winner_name,
+    loser: row.loser_name,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    startedAt: row.started_at,
+    completedAt: row.completed_at,
+  };
+}
+
+function serializeSlot(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    slotName: row.slot_name,
+    host: row.host,
+    gamePort: row.game_port,
+    gotvPort: row.gotv_port,
+    rconPort: row.rcon_port,
+    status: row.status,
+    currentMatchId: row.current_match_id,
+    lastHeartbeatAt: row.last_heartbeat_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+function createServerEvent({
+  matchId = null,
+  slotId = null,
+  eventType,
+  payload = {},
+  sourceEventId = null,
+  createdAt = nowIso(),
+}) {
+  return db.prepare(`
+    INSERT OR IGNORE INTO server_events (
+      id, match_id, slot_id, event_type, source_event_id, payload_json, created_at
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `).run(makeId("evt"), matchId, slotId, eventType, sourceEventId, JSON.stringify(payload), createdAt);
+}
+
+function hasControllerConfigured() {
+  return Boolean(controllerUrl && controllerToken);
+}
+
+async function controllerRequest(method, pathname, body) {
+  const response = await fetch(`${controllerUrl}${pathname}`, {
+    method,
+    headers: {
+      "Content-Type": "application/json",
+      "x-controller-token": controllerToken,
+    },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(data.error || `controller_${response.status}`);
+  }
+  return data;
+}
 
 // ── Balance state (in-memory) ──
 
@@ -331,71 +445,483 @@ app.post("/lock-wager", (req, res) => {
 
 // ── Match server management ──
 
-let activeMatch = null;
-let matchResult = null;
+let activeMatchId = null;
+let latestMatchResult = null;
 let skipRequested = false;
 let mockServerProcess = null;
+const matchLifecycleTimers = new Map();
 
-// Store match data and auto-spawn mock server.
-app.post("/start-match-server", (req, res) => {
-  const { playerAName, playerBName, wagerAmount, map } = req.body || {};
+function updateMatchStatus(matchId, status, extra = {}) {
+  const current = db.prepare("SELECT * FROM matches WHERE id = ?").get(matchId);
+  if (!current || ["completed", "cancelled", "abandoned", "failed"].includes(current.status)) {
+    return;
+  }
 
-  if (!playerAName || !playerBName || !wagerAmount) {
+  const next = {
+    player_one_name: current.player_one_name,
+    player_one_steam_id: current.player_one_steam_id,
+    player_two_name: current.player_two_name,
+    player_two_steam_id: current.player_two_steam_id,
+    wager_id: current.wager_id,
+    selected_map: current.selected_map,
+    region: current.region,
+    server_slot_id: current.server_slot_id,
+    server_ip: current.server_ip,
+    server_port: current.server_port,
+    server_password: current.server_password,
+    winner_name: current.winner_name,
+    loser_name: current.loser_name,
+    started_at: current.started_at,
+    completed_at: current.completed_at,
+    ...extra,
+  };
+
+  db.prepare(`
+    UPDATE matches
+    SET status = ?, wager_id = ?, player_one_name = ?, player_one_steam_id = ?, player_two_name = ?,
+        player_two_steam_id = ?, selected_map = ?, region = ?, server_slot_id = ?, server_ip = ?,
+        server_port = ?, server_password = ?, winner_name = ?, loser_name = ?, started_at = ?,
+        completed_at = ?, updated_at = ?
+    WHERE id = ?
+  `).run(
+    status,
+    next.wager_id,
+    next.player_one_name,
+    next.player_one_steam_id,
+    next.player_two_name,
+    next.player_two_steam_id,
+    next.selected_map,
+    next.region,
+    next.server_slot_id,
+    next.server_ip,
+    next.server_port,
+    next.server_password,
+    next.winner_name,
+    next.loser_name,
+    next.started_at,
+    next.completed_at,
+    nowIso(),
+    matchId
+  );
+}
+
+function updateSlotStatus(slotId, status, currentMatchId = null) {
+  db.prepare(`
+    UPDATE server_slots
+    SET status = ?, current_match_id = ?, updated_at = ?, last_heartbeat_at = ?
+    WHERE id = ?
+  `).run(status, currentMatchId, nowIso(), nowIso(), slotId);
+}
+
+function scheduleMatchLifecycle(matchId, slotId) {
+  const steps = [
+    { delay: 1500, status: "server_ready", eventType: "server.ready" },
+    { delay: 3500, status: "awaiting_players", eventType: "players.awaiting" },
+    {
+      delay: 6000,
+      status: "live",
+      eventType: "match.live",
+      extra: { started_at: nowIso() },
+    },
+  ];
+
+  const timers = steps.map(({ delay, status, eventType, extra }) =>
+    setTimeout(() => {
+      updateMatchStatus(matchId, status, extra);
+      createServerEvent({
+        matchId,
+        slotId,
+        eventType,
+        payload: { status },
+      });
+    }, delay)
+  );
+
+  matchLifecycleTimers.set(matchId, timers);
+}
+
+function clearMatchLifecycle(matchId) {
+  const timers = matchLifecycleTimers.get(matchId) || [];
+  timers.forEach(clearTimeout);
+  matchLifecycleTimers.delete(matchId);
+}
+
+function completeMatch(matchId, winnerName, loserName, source = "controller") {
+  const activeMatch = db.prepare("SELECT * FROM matches WHERE id = ?").get(matchId);
+  if (!activeMatch || activeMatch.status === "completed") {
+    return latestMatchResult;
+  }
+
+  const wager = activeMatch.wager_id
+    ? db.prepare("SELECT amount_cents FROM wagers WHERE id = ?").get(activeMatch.wager_id)
+    : null;
+  const wagerAmount = wager?.amount_cents || 0;
+  const pot = wagerAmount * 2;
+
+  addBalance(winnerName, pot);
+
+  clearMatchLifecycle(matchId);
+  updateMatchStatus(matchId, "completed", {
+    winner_name: winnerName,
+    loser_name: loserName,
+    completed_at: nowIso(),
+  });
+  if (activeMatch.server_slot_id) {
+    updateSlotStatus(activeMatch.server_slot_id, "available", null);
+  }
+  createServerEvent({
+    matchId,
+    slotId: activeMatch.server_slot_id,
+    eventType: "match.completed",
+    payload: { winner: winnerName, loser: loserName, source },
+  });
+
+  if (activeMatch.wager_id) {
+    db.prepare(`
+      UPDATE wagers
+      SET status = ?, winner_name = ?, loser_name = ?, updated_at = ?
+      WHERE id = ?
+    `).run("completed", winnerName, loserName, nowIso(), activeMatch.wager_id);
+  }
+
+  latestMatchResult = {
+    matchId,
+    winner: winnerName,
+    loser: loserName,
+    wagerAmount,
+    winnerBalance: getBalance(winnerName),
+    loserBalance: getBalance(loserName),
+  };
+
+  if (activeMatchId === matchId) {
+    activeMatchId = null;
+    skipRequested = false;
+  }
+
+  console.log("[match] completed", {
+    matchId,
+    winner: winnerName,
+    loser: loserName,
+    source,
+    pot,
+  });
+
+  return latestMatchResult;
+}
+
+function applyControllerEvent(match, event) {
+  const payload = event.payload || {};
+  const inserted = createServerEvent({
+    matchId: match.id,
+    slotId: match.server_slot_id,
+    eventType: event.eventType,
+    payload,
+    sourceEventId: event.id,
+    createdAt: event.createdAt || nowIso(),
+  });
+
+  if (!inserted.changes) {
+    return;
+  }
+
+  switch (event.eventType) {
+    case "server.ready":
+      updateMatchStatus(match.id, "server_ready");
+      break;
+    case "player.connected":
+    case "player.validated":
+    case "player.joined":
+    case "player.team":
+      updateMatchStatus(match.id, "awaiting_players");
+      break;
+    case "round.start":
+    case "player.kill":
+    case "round.win":
+    case "match.score":
+      updateMatchStatus(match.id, "live", {
+        started_at: match.started_at || nowIso(),
+      });
+      break;
+    case "match.completed":
+      completeMatch(match.id, payload.winnerName, payload.loserName, "controller");
+      break;
+    default:
+      break;
+  }
+}
+
+async function syncControllerMatch(matchId) {
+  if (!hasControllerConfigured()) {
+    return null;
+  }
+
+  const match = db.prepare("SELECT * FROM matches WHERE id = ?").get(matchId);
+  if (!match || !match.server_slot_id) {
+    return match;
+  }
+
+  const data = await controllerRequest("GET", `/matches/${matchId}`);
+  if (Array.isArray(data.events)) {
+    for (const event of data.events) {
+      applyControllerEvent(match, event);
+    }
+  }
+  return db.prepare("SELECT * FROM matches WHERE id = ?").get(matchId);
+}
+
+async function syncControllerSlots() {
+  if (!hasControllerConfigured()) {
+    return [];
+  }
+
+  const data = await controllerRequest("GET", "/slots");
+  const slots = Array.isArray(data.slots) ? data.slots : [];
+
+  for (const slot of slots) {
+    db.prepare(`
+      UPDATE server_slots
+      SET host = ?, game_port = ?, gotv_port = ?, rcon_port = ?, status = ?,
+          current_match_id = ?, last_heartbeat_at = ?, updated_at = ?
+      WHERE id = ?
+    `).run(
+      slot.host || null,
+      slot.gamePort || null,
+      slot.gotvPort || null,
+      slot.rconPort || null,
+      slot.status || "available",
+      slot.currentMatchId || null,
+      slot.lastHeartbeatAt || nowIso(),
+      nowIso(),
+      slot.id
+    );
+  }
+
+  return slots;
+}
+
+// Store match data and either call the VM controller or fall back to the local mock server.
+app.post("/start-match-server", async (req, res) => {
+  const { playerAName, playerBName, wagerAmount, map, wagerId, matchProfile } = req.body || {};
+  const resolvedMatchProfile =
+    matchProfile === "solo_debug" || matchProfile === "fast_solo_debug"
+      ? matchProfile
+      : "duo_match";
+  const resolvedPlayerBName =
+    resolvedMatchProfile === "duo_match" ? playerBName : playerBName || "BotOpponent";
+
+  if (!playerAName || !resolvedPlayerBName || !wagerAmount) {
     return res.status(400).json({ error: "player names and wager amount are required" });
   }
 
-  activeMatch = {
-    playerAName,
-    playerBName,
-    wagerAmount,
-    map: map || "de_dust2",
-    status: "waiting",
-  };
-  matchResult = null;
-  skipRequested = false;
+  try {
+    await syncControllerSlots();
 
-  // Kill any existing mock server
-  if (mockServerProcess) {
-    mockServerProcess.kill();
-    mockServerProcess = null;
+    const availableSlot = db
+      .prepare("SELECT * FROM server_slots WHERE status = 'available' ORDER BY slot_name LIMIT 1")
+      .get();
+    if (!availableSlot) {
+      return res.status(409).json({ error: "No available server slots" });
+    }
+
+    const matchId = makeId("match");
+    const validWagerId = wagerId
+      ? db.prepare("SELECT id FROM wagers WHERE id = ?").get(wagerId)?.id || null
+      : null;
+    const password = Math.random().toString(36).slice(2, 8);
+    const createdAt = nowIso();
+
+    db.prepare(`
+      INSERT INTO matches (
+        id, wager_id, player_one_name, player_one_steam_id, player_two_name, player_two_steam_id,
+        status, selected_map, region, server_slot_id, server_ip, server_port, server_password,
+        winner_name, loser_name, started_at, completed_at, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      matchId,
+      validWagerId,
+      playerAName,
+      null,
+      resolvedPlayerBName,
+      req.user?.steamId || null,
+      "allocating_server",
+      map || "de_dust2",
+      "NA",
+      availableSlot.id,
+      availableSlot.host,
+      availableSlot.game_port,
+      password,
+      null,
+      null,
+      null,
+      null,
+      createdAt,
+      createdAt
+    );
+
+    updateSlotStatus(availableSlot.id, "allocated", matchId);
+    createServerEvent({
+      matchId,
+      slotId: availableSlot.id,
+      eventType: "slot.allocated",
+      payload: { slotId: availableSlot.id, host: availableSlot.host, gamePort: availableSlot.game_port },
+    });
+
+    if (validWagerId) {
+      db.prepare(`
+        UPDATE wagers
+        SET opponent_username = ?, opponent_steam_id = ?, status = ?, match_id = ?, updated_at = ?
+        WHERE id = ?
+      `).run(
+        resolvedPlayerBName,
+        req.user?.steamId || null,
+        "allocating_server",
+        matchId,
+        nowIso(),
+        validWagerId
+      );
+    }
+
+    const activeMatch = {
+      matchId,
+      playerAName,
+      playerBName: resolvedPlayerBName,
+      wagerAmount,
+      map: map || "de_dust2",
+      matchProfile: resolvedMatchProfile,
+      status: "allocating_server",
+      serverIp: availableSlot.host,
+      serverPort: availableSlot.game_port,
+      serverPassword: password,
+      slotId: availableSlot.id,
+    };
+    activeMatchId = matchId;
+    latestMatchResult = null;
+    skipRequested = false;
+
+    if (hasControllerConfigured()) {
+      const controllerResponse = await controllerRequest(
+        "POST",
+        `/slots/${availableSlot.id}/start-match`,
+        {
+          matchId,
+          playerAName,
+          playerBName: resolvedPlayerBName,
+          map: activeMatch.map,
+          serverPassword: activeMatch.serverPassword,
+          hostname: `SafeWager ${playerAName} vs ${resolvedPlayerBName}`,
+          matchProfile: resolvedMatchProfile,
+        }
+      );
+
+      db.prepare(`
+        UPDATE matches
+        SET server_ip = ?, server_port = ?, server_password = ?, updated_at = ?
+        WHERE id = ?
+      `).run(
+        controllerResponse.host || activeMatch.serverIp,
+        controllerResponse.gamePort || activeMatch.serverPort,
+        controllerResponse.serverPassword || activeMatch.serverPassword,
+        nowIso(),
+        matchId
+      );
+
+      console.log("[match] start-match-server — controller request sent", {
+        matchId,
+        playerA: playerAName,
+        playerB: resolvedPlayerBName,
+        matchProfile: resolvedMatchProfile,
+        slotId: availableSlot.id,
+      });
+
+      return res.json({
+        ok: true,
+        matchId,
+        status: controllerResponse.status || "allocating_server",
+        map: activeMatch.map,
+        serverIp: controllerResponse.host || activeMatch.serverIp,
+        serverPort: controllerResponse.gamePort || activeMatch.serverPort,
+        serverPassword: controllerResponse.serverPassword || activeMatch.serverPassword,
+        slotId: availableSlot.id,
+      });
+    }
+
+    clearMatchLifecycle(matchId);
+    scheduleMatchLifecycle(matchId, availableSlot.id);
+
+    if (mockServerProcess) {
+      mockServerProcess.kill();
+      mockServerProcess = null;
+    }
+
+    const scriptPath = path.join(__dirname, "..", "mock-server", "index.js");
+    mockServerProcess = spawn("node", [scriptPath], {
+      stdio: ["pipe", "pipe", "pipe"],
+      env: { ...process.env, FORCE_COLOR: "0" },
+    });
+
+    mockServerProcess.stdout.on("data", (data) => {
+      process.stdout.write(`[cs2] ${data}`);
+    });
+
+    mockServerProcess.stderr.on("data", (data) => {
+      process.stderr.write(`[cs2 err] ${data}`);
+    });
+
+    mockServerProcess.on("close", (code) => {
+      console.log(`[cs2] mock server exited with code ${code}`);
+      mockServerProcess = null;
+    });
+
+    console.log("[match] start-match-server — mock server spawned", {
+      matchId,
+      map: activeMatch.map,
+      playerA: playerAName,
+      playerB: resolvedPlayerBName,
+      matchProfile: resolvedMatchProfile,
+      wagerAmount,
+      slotId: availableSlot.id,
+    });
+
+    return res.json({
+      ok: true,
+      matchId,
+      status: "allocating_server",
+      map: activeMatch.map,
+      serverIp: activeMatch.serverIp,
+      serverPort: activeMatch.serverPort,
+      serverPassword: activeMatch.serverPassword,
+      slotId: activeMatch.slotId,
+    });
+  } catch (err) {
+    updateMatchStatus(matchId, "failed");
+    updateSlotStatus(availableSlot.id, "available", null);
+    console.error("[match] start-match-server error", err.message);
+    return res.status(500).json({ error: err.message || "server_error" });
   }
-
-  // Spawn mock server as child process
-  const scriptPath = path.join(__dirname, "..", "mock-server", "index.js");
-  mockServerProcess = spawn("node", [scriptPath], {
-    stdio: ["pipe", "pipe", "pipe"],
-    env: { ...process.env, FORCE_COLOR: "0" },
-  });
-
-  mockServerProcess.stdout.on("data", (data) => {
-    process.stdout.write(`[cs2] ${data}`);
-  });
-
-  mockServerProcess.stderr.on("data", (data) => {
-    process.stderr.write(`[cs2 err] ${data}`);
-  });
-
-  mockServerProcess.on("close", (code) => {
-    console.log(`[cs2] mock server exited with code ${code}`);
-    mockServerProcess = null;
-  });
-
-  console.log("[match] start-match-server — mock server spawned", {
-    map: activeMatch.map,
-    playerA: playerAName,
-    playerB: playerBName,
-    wagerAmount,
-  });
-
-  res.json({ status: "running", map: activeMatch.map });
 });
 
 // Mock server fetches this to know who's playing.
 app.get("/active-match", (_req, res) => {
-  if (!activeMatch) {
+  if (!activeMatchId) {
     return res.status(404).json({ error: "no active match" });
   }
-  res.json(activeMatch);
+  const match = db.prepare("SELECT * FROM matches WHERE id = ?").get(activeMatchId);
+  if (!match) {
+    return res.status(404).json({ error: "no active match" });
+  }
+  res.json({
+    matchId: match.id,
+    playerAName: match.player_one_name,
+    playerBName: match.player_two_name,
+    wagerAmount: match.wager_id
+      ? db.prepare("SELECT amount_cents FROM wagers WHERE id = ?").get(match.wager_id)?.amount_cents || 0
+      : 0,
+    map: match.selected_map,
+    status: match.status,
+    serverIp: match.server_ip,
+    serverPort: match.server_port,
+    serverPassword: match.server_password,
+  });
 });
 
 // Frontend calls this to skip to end.
@@ -414,39 +940,21 @@ app.get("/should-skip", (_req, res) => {
 app.post("/resolve-match", (req, res) => {
   try {
     const { winner } = req.body || {};
-    if (!activeMatch) {
+    if (!activeMatchId) {
       return res.status(400).json({ error: "no active match to resolve" });
     }
     if (!winner || (winner !== "A" && winner !== "B")) {
       return res.status(400).json({ error: "winner must be 'A' or 'B'" });
     }
 
-    const winnerName = winner === "A" ? activeMatch.playerAName : activeMatch.playerBName;
-    const loserName = winner === "A" ? activeMatch.playerBName : activeMatch.playerAName;
-    const pot = activeMatch.wagerAmount * 2;
+    const activeMatch = db.prepare("SELECT * FROM matches WHERE id = ?").get(activeMatchId);
+    if (!activeMatch) {
+      return res.status(400).json({ error: "active match record not found" });
+    }
 
-    // Credit winner with full pot (their own wager + loser's wager)
-    addBalance(winnerName, pot);
-
-    console.log("[match] resolved", {
-      winner: winnerName,
-      loser: loserName,
-      pot,
-      winnerBalance: getBalance(winnerName),
-      loserBalance: getBalance(loserName),
-    });
-
-    matchResult = {
-      winner: winnerName,
-      loser: loserName,
-      wagerAmount: activeMatch.wagerAmount,
-      winnerBalance: getBalance(winnerName),
-      loserBalance: getBalance(loserName),
-    };
-
-    activeMatch = null;
-    skipRequested = false;
-    res.json(matchResult);
+    const winnerName = winner === "A" ? activeMatch.player_one_name : activeMatch.player_two_name;
+    const loserName = winner === "A" ? activeMatch.player_two_name : activeMatch.player_one_name;
+    res.json(completeMatch(activeMatchId, winnerName, loserName, "mock-server"));
   } catch (err) {
     console.error("[match] resolve error", err.message);
     res.status(500).json({ error: err.message || "server_error" });
@@ -454,17 +962,23 @@ app.post("/resolve-match", (req, res) => {
 });
 
 // Frontend polls this to check if the match has been resolved.
-app.get("/match-result", (_req, res) => {
-  if (!matchResult) {
+app.get("/match-result", async (_req, res) => {
+  if (activeMatchId && hasControllerConfigured()) {
+    try {
+      await syncControllerMatch(activeMatchId);
+    } catch (err) {
+      console.error("[match] controller sync error", err.message);
+    }
+  }
+  if (!latestMatchResult) {
     return res.json({ resolved: false });
   }
-  res.json({ resolved: true, ...matchResult });
+  res.json({ resolved: true, ...latestMatchResult });
 });
 
 // ── Integrity check state ──
 
 const integrityResults = {}; // { steamId: { stats, timestamp, passed } }
-const wagerHistory = []; // [{ id, creator, creatorSteamId, opponent, opponentSteamId, amount, map, result, timestamp }]
 
 const INTEGRITY_TTL = 24 * 60 * 60 * 1000; // 24 hours
 const CHEAT_THRESHOLD = 50; // percentage
@@ -538,51 +1052,167 @@ app.post("/create-wager", (req, res) => {
     return res.status(403).json({ error: "Integrity check failed — cheating percentage too high" });
   }
 
-  const wager = {
-    id: "w" + Date.now(),
-    creator: req.user.username,
-    creatorSteamId: req.user.steamId,
-    creatorAvatar: req.user.avatar,
-    amount,
-    map,
-    status: "open",
-    opponent: null,
-    opponentSteamId: null,
-    result: null,
-    timestamp: Date.now(),
-  };
+  const amountCents = parseAmountToCents(amount);
+  if (!amountCents) {
+    return res.status(400).json({ error: "amount must be a positive currency value" });
+  }
 
-  wagerHistory.push(wager);
-  console.log("[wager] created", { id: wager.id, creator: wager.creator, amount, map });
-  res.json(wager);
+  const wagerId = makeId("wager");
+  const createdAt = nowIso();
+  db.prepare(`
+    INSERT INTO wagers (
+      id, creator_username, creator_steam_id, creator_avatar, opponent_username,
+      opponent_steam_id, amount_cents, map, status, match_id, winner_name, loser_name,
+      created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    wagerId,
+    req.user.username,
+    req.user.steamId,
+    req.user.avatar || null,
+    null,
+    null,
+    amountCents,
+    map,
+    "open",
+    null,
+    null,
+    null,
+    createdAt,
+    createdAt
+  );
+
+  const wager = db.prepare("SELECT * FROM wagers WHERE id = ?").get(wagerId);
+  console.log("[wager] created", { id: wagerId, creator: req.user.username, amount: amountCents, map });
+  res.json(serializeWager(wager));
 });
 
 // List all open wagers.
 app.get("/wagers", (_req, res) => {
-  res.json(wagerHistory.filter((w) => w.status === "open" || w.status === "in_progress"));
+  const rows = db.prepare(`
+    SELECT * FROM wagers
+    WHERE status IN ('open', 'allocating_server', 'server_ready', 'awaiting_players', 'live')
+    ORDER BY created_at DESC
+  `).all();
+  res.json(rows.map(serializeWager));
 });
 
 // Update wager result after match resolves.
 app.post("/wager-result", (req, res) => {
   const { wagerId, winner, loser } = req.body || {};
-  const wager = wagerHistory.find((w) => w.id === wagerId);
-  if (!wager) return res.status(404).json({ error: "wager not found" });
-  wager.result = { winner, loser };
-  wager.status = "resolved";
-  res.json(wager);
+  const wager = db.prepare("SELECT * FROM wagers WHERE id = ?").get(wagerId);
+  if (!wager) {
+    return res.status(404).json({ error: "wager not found" });
+  }
+  db.prepare(`
+    UPDATE wagers
+    SET status = ?, winner_name = ?, loser_name = ?, updated_at = ?
+    WHERE id = ?
+  `).run("completed", winner || null, loser || null, nowIso(), wagerId);
+  res.json(serializeWager(db.prepare("SELECT * FROM wagers WHERE id = ?").get(wagerId)));
 });
 
 // Get profile data for a user (integrity + wager history).
 app.get("/profile/:steamId", (req, res) => {
   const { steamId } = req.params;
   const integrity = getIntegrity(steamId);
-  const userWagers = wagerHistory.filter(
-    (w) => w.creatorSteamId === steamId || w.opponentSteamId === steamId
-  );
-  res.json({ integrity, wagers: userWagers });
+  const userWagers = db.prepare(`
+    SELECT * FROM wagers
+    WHERE creator_steam_id = ? OR opponent_steam_id = ?
+    ORDER BY created_at DESC
+  `).all(steamId, steamId);
+  res.json({ integrity, wagers: userWagers.map(serializeWager) });
+});
+
+// ── Pre-VM server orchestration scaffolding ──
+
+app.get("/server-slots", (_req, res) => {
+  const rows = db.prepare("SELECT * FROM server_slots ORDER BY slot_name").all();
+  res.json(rows.map(serializeSlot));
+});
+
+app.get("/matches/:matchId", async (req, res) => {
+  try {
+    if (hasControllerConfigured()) {
+      await syncControllerMatch(req.params.matchId);
+    }
+  } catch (err) {
+    console.error("[match] controller sync error", err.message);
+  }
+
+  const match = db.prepare("SELECT * FROM matches WHERE id = ?").get(req.params.matchId);
+  if (!match) {
+    return res.status(404).json({ error: "match not found" });
+  }
+  const events = db.prepare(`
+    SELECT * FROM server_events
+    WHERE match_id = ?
+    ORDER BY created_at ASC
+  `).all(req.params.matchId);
+
+  res.json({
+    match: serializeMatch(match),
+    events: events.map((event) => ({
+      id: event.id,
+      eventType: event.event_type,
+      payload: JSON.parse(event.payload_json),
+      createdAt: event.created_at,
+    })),
+  });
+});
+
+app.post("/internal/server-events", (req, res) => {
+  const { matchId, slotId, eventType, payload } = req.body || {};
+  if (!eventType) {
+    return res.status(400).json({ error: "eventType is required" });
+  }
+  createServerEvent({
+    matchId: matchId || null,
+    slotId: slotId || null,
+    eventType,
+    payload: payload || {},
+  });
+  res.json({ ok: true });
+});
+
+app.post("/internal/slot-heartbeat", (req, res) => {
+  const { slotId, status } = req.body || {};
+  if (!slotId) {
+    return res.status(400).json({ error: "slotId is required" });
+  }
+
+  const slot = db.prepare("SELECT * FROM server_slots WHERE id = ?").get(slotId);
+  if (!slot) {
+    return res.status(404).json({ error: "slot not found" });
+  }
+
+  updateSlotStatus(slotId, status || slot.status, slot.current_match_id || null);
+  createServerEvent({
+    matchId: slot.current_match_id,
+    slotId,
+    eventType: "slot.heartbeat",
+    payload: { status: status || slot.status },
+  });
+  res.json({ ok: true });
+});
+
+app.post("/internal/match-result", (req, res) => {
+  const { matchId, winnerName, loserName } = req.body || {};
+  if (!matchId || !winnerName || !loserName) {
+    return res.status(400).json({ error: "matchId, winnerName, and loserName are required" });
+  }
+
+  const match = db.prepare("SELECT * FROM matches WHERE id = ?").get(matchId);
+  if (!match) {
+    return res.status(404).json({ error: "match not found" });
+  }
+
+  completeMatch(matchId, winnerName, loserName, "controller-callback");
+  res.json({ ok: true });
 });
 
 const port = process.env.PORT || 4242;
 app.listen(port, () => {
   console.log(`Backend running on http://localhost:${port}`);
+  console.log(`[db] SQLite ready at ${dbPath}`);
 });
