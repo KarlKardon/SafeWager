@@ -230,10 +230,16 @@
   box-shadow: 0 8px 24px rgba(255, 122, 26, 0.1);
 }
 
+.mock-card {
+  border-style: dashed;
+  border-color: rgba(255, 122, 26, 0.18);
+  background: linear-gradient(135deg, rgba(255, 122, 26, 0.04), rgba(255, 255, 255, 0.02));
+}
+
 .wager-top {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
+  display: grid;
+  gap: 10px;
+  justify-items: center;
 }
 
 .wager-user {
@@ -264,11 +270,89 @@
   letter-spacing: 0.12em;
 }
 
+.mock-badge {
+  color: var(--warning);
+}
+
+.wager-scoreboard {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  gap: 16px;
+  align-items: center;
+}
+
+.feed-player {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+
+.feed-player-button {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+  padding: 0;
+  margin: 0;
+  border: none;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+}
+
+.feed-player-button.clickable {
+  cursor: pointer;
+}
+
+.feed-player-button.clickable:hover .wager-name {
+  color: var(--accent);
+}
+
+.feed-player-button:disabled {
+  cursor: default;
+}
+
+.feed-player.right {
+  flex-direction: row-reverse;
+  text-align: right;
+}
+
+.feed-player.right .feed-player-button {
+  flex-direction: row-reverse;
+  text-align: right;
+}
+
+.feed-player-meta {
+  min-width: 0;
+}
+
+.feed-player-score {
+  margin: 4px 0 0;
+  font-size: 28px;
+  font-weight: 700;
+  color: var(--text);
+}
+
 .wager-map {
   padding: 10px 14px;
   border-radius: 10px;
   background: var(--panel-3);
   border: 1px solid rgba(255, 255, 255, 0.04);
+}
+
+.wager-actions {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+}
+
+.wager-actions .btn.accent {
+  flex: 1;
+}
+
+.wager-actions .btn.ghost {
+  flex-shrink: 0;
 }
 
 .map-name {
@@ -294,6 +378,36 @@
 
 .empty-state p { margin: 0; }
 .empty-state .btn { margin-top: 12px; }
+
+.integrity-callout {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 16px 18px;
+  border-radius: 14px;
+  background: linear-gradient(135deg, rgba(255, 122, 26, 0.12), rgba(255, 255, 255, 0.03));
+  border: 1px solid rgba(255, 122, 26, 0.28);
+  cursor: pointer;
+}
+
+.integrity-callout-title {
+  margin: 0 0 4px;
+  color: var(--accent);
+  font-weight: 700;
+}
+
+.integrity-callout .muted {
+  margin: 0;
+}
+
+.integrity-callout-arrow {
+  font-size: 28px;
+  line-height: 1;
+  color: var(--accent);
+  animation: integrityArrowBounce 1s ease-in-out infinite;
+  flex-shrink: 0;
+}
 
 /* ── Banner ── */
 
@@ -608,6 +722,45 @@
 
 .server-card h4 { margin: 4px 0 0; }
 
+.status-inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.status-spinner {
+  width: 14px;
+  height: 14px;
+  border: 2px solid rgba(255, 255, 255, 0.18);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+  flex-shrink: 0;
+}
+
+.join-command-card {
+  grid-column: 1 / -1;
+}
+
+.join-command-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 4px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.join-command-row code {
+  flex: 1;
+  overflow-x: auto;
+  white-space: nowrap;
+  color: var(--text);
+  font-size: 12px;
+}
+
 /* ── Match in progress ── */
 
 .match-in-progress {
@@ -744,6 +897,11 @@
 @keyframes pulse {
   0%, 100% { opacity: 1; }
   50% { opacity: 0.3; }
+}
+
+@keyframes integrityArrowBounce {
+  0%, 100% { transform: translate(0, 0); }
+  50% { transform: translate(6px, -6px); }
 }
 
 @keyframes urgentPulse {
@@ -899,6 +1057,25 @@
   border-radius: 16px;
 }
 
+.profile-avatar.small {
+  width: 56px;
+  height: 56px;
+  border-radius: 14px;
+}
+
+.audit-modal-header {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+
+.audit-avatar-fallback {
+  width: 56px;
+  height: 56px;
+  border-radius: 14px;
+  font-size: 16px;
+}
+
 .profile-section {
   margin-top: 24px;
 }
@@ -965,6 +1142,20 @@
   font-size: 13px;
 }
 
+.history-matchup {
+  min-width: 0;
+}
+
+.history-subline {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.history-result {
+  text-align: right;
+}
+
 /* ── Responsive ── */
 
 @media (max-width: 640px) {
@@ -972,6 +1163,11 @@
   .user-name { display: none; }
   .main { padding: 20px 16px; }
   .server-card { grid-template-columns: 1fr; }
+  .wager-scoreboard { grid-template-columns: 1fr; }
+  .feed-player.right { flex-direction: row; text-align: left; }
+  .feed-player.right .feed-player-button { flex-direction: row; text-align: left; }
+  .wager-top { justify-items: start; }
   .audit-grid { grid-template-columns: 1fr; }
   .history-row { grid-template-columns: 1fr 1fr; }
+  .history-result { text-align: left; }
 }

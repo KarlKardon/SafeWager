@@ -1,0 +1,15 @@
+[Unit]
+Description=SafeWager backend
+After=network.target
+
+[Service]
+Type=simple
+User=collin
+WorkingDirectory=/home/collin/SafeWager/backend
+EnvironmentFile=/home/collin/SafeWager/.env
+ExecStart=/usr/bin/env node index.js
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

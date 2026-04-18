@@ -20,6 +20,10 @@ db.exec(`
     creator_avatar TEXT,
     opponent_username TEXT,
     opponent_steam_id TEXT,
+    opponent_avatar TEXT,
+    wager_type TEXT NOT NULL DEFAULT 'pvp',
+    match_profile TEXT,
+    match_rules_json TEXT,
     amount_cents INTEGER NOT NULL,
     map TEXT NOT NULL,
     status TEXT NOT NULL,
@@ -85,6 +89,20 @@ db.exec(`
     created_at TEXT NOT NULL
   );
 `);
+
+const wagerColumns = db.prepare("PRAGMA table_info(wagers)").all();
+if (!wagerColumns.some((column) => column.name === "wager_type")) {
+  db.exec("ALTER TABLE wagers ADD COLUMN wager_type TEXT NOT NULL DEFAULT 'pvp'");
+}
+if (!wagerColumns.some((column) => column.name === "match_profile")) {
+  db.exec("ALTER TABLE wagers ADD COLUMN match_profile TEXT");
+}
+if (!wagerColumns.some((column) => column.name === "opponent_avatar")) {
+  db.exec("ALTER TABLE wagers ADD COLUMN opponent_avatar TEXT");
+}
+if (!wagerColumns.some((column) => column.name === "match_rules_json")) {
+  db.exec("ALTER TABLE wagers ADD COLUMN match_rules_json TEXT");
+}
 
 const serverEventColumns = db.prepare("PRAGMA table_info(server_events)").all();
 if (!serverEventColumns.some((column) => column.name === "source_event_id")) {

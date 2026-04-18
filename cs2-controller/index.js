@@ -88,7 +88,13 @@ function getSlot() {
       lastHeartbeatAt: null,
     };
   }
-  return state.slots[CONFIG.slotId];
+  const slot = state.slots[CONFIG.slotId];
+  slot.slotName = CONFIG.slotName;
+  slot.host = CONFIG.publicHost;
+  slot.gamePort = CONFIG.gamePort;
+  slot.gotvPort = CONFIG.gotvPort;
+  slot.rconPort = CONFIG.rconPort;
+  return slot;
 }
 
 function getMatch(matchId) {
@@ -101,6 +107,7 @@ function ensureMatch(matchId) {
       id: matchId,
       matchProfile: "duo_match",
       status: "allocating_server",
+      matchRules: null,
       scoreCt: 0,
       scoreT: 0,
       playerTeams: {},
@@ -378,7 +385,24 @@ function isExpectedRealPlayer(match, playerName, steamId) {
   return playerName === match.playerAName || playerName === match.playerBName;
 }
 
+function isBotDebugProfile(match) {
+  return match && (match.matchProfile === "solo_debug" || match.matchProfile === "fast_solo_debug");
+}
+
+function getCanonicalPlayerName(match, playerName, steamId) {
+  if (isExpectedRealPlayer(match, playerName, steamId)) {
+    return playerName;
+  }
+  if (steamId === "BOT" && isBotDebugProfile(match)) {
+    return match.playerBName;
+  }
+  return null;
+}
+
 function getProfileWinTarget(match) {
+  if (match && match.matchRules && match.matchRules.roundTarget) {
+    return Number(match.matchRules.roundTarget);
+  }
   if (match && match.matchProfile === "fast_solo_debug") {
     return 1;
   }
@@ -454,10 +478,16 @@ function maybeCompleteMatch(matchId) {
 
   const winnerTeam = match.scoreCt >= winTarget ? "CT" : "TERRORIST";
   const loserTeam = winnerTeam === "CT" ? "TERRORIST" : "CT";
+  const playerATeam = match.playerTeams[match.playerAName];
+  const playerBTeam = match.playerTeams[match.playerBName];
   const winnerName =
+    (playerATeam === winnerTeam ? match.playerAName : null) ||
+    (playerBTeam === winnerTeam ? match.playerBName : null) ||
     inferPlayersByTeam(match, winnerTeam)[0] ||
     (winnerTeam === "CT" ? match.playerAName : match.playerBName);
   const loserName =
+    (playerATeam === loserTeam ? match.playerAName : null) ||
+    (playerBTeam === loserTeam ? match.playerBName : null) ||
     inferPlayersByTeam(match, loserTeam)[0] ||
     (loserTeam === "CT" ? match.playerAName : match.playerBName);
 
@@ -497,69 +527,91 @@ function processLine(line) {
   let m = line.match(/"(.+?)<\d+><(.+?)><.*?>" connected, address "(.+?)"/);
   if (m) {
     const [, playerName, steamId, address] = m;
-    if (isExpectedRealPlayer(match, playerName, steamId)) {
-      match.playerSteamIds[playerName] = steamId;
+    const canonicalPlayerName = getCanonicalPlayerName(match, playerName, steamId);
+    if (canonicalPlayerName) {
+      match.playerSteamIds[canonicalPlayerName] = steamId;
     }
     updateMatchStatus(matchId, "awaiting_players", {
       playerSteamIds: match.playerSteamIds,
     });
-    appendEvent(matchId, "player.connected", { playerName, steamId, address });
+    appendEvent(matchId, "player.connected", {
+      playerName: canonicalPlayerName || playerName,
+      sourcePlayerName: playerName,
+      steamId,
+      address,
+    });
     return;
   }
 
   m = line.match(/"(.+?)<\d+><(.+?)><.*?>" STEAM USERID validated/);
   if (m) {
     const [, playerName, steamId] = m;
-    if (isExpectedRealPlayer(match, playerName, steamId)) {
-      match.validatedPlayers[playerName] = true;
-      match.playerSteamIds[playerName] = steamId;
+    const canonicalPlayerName = getCanonicalPlayerName(match, playerName, steamId);
+    if (canonicalPlayerName) {
+      match.validatedPlayers[canonicalPlayerName] = true;
+      match.playerSteamIds[canonicalPlayerName] = steamId;
       updateMatchStatus(matchId, "awaiting_players", {
         validatedPlayers: match.validatedPlayers,
         playerSteamIds: match.playerSteamIds,
       });
     }
-    appendEvent(matchId, "player.validated", { playerName, steamId });
+    appendEvent(matchId, "player.validated", {
+      playerName: canonicalPlayerName || playerName,
+      sourcePlayerName: playerName,
+      steamId,
+    });
     return;
   }
 
   m = line.match(/"(.+?)<\d+><(.+?)><.*?>" entered the game/);
   if (m) {
     const [, playerName, steamId] = m;
-    if (isExpectedRealPlayer(match, playerName, steamId)) {
-      match.playersJoined[playerName] = true;
-      match.playerSteamIds[playerName] = steamId;
+    const canonicalPlayerName = getCanonicalPlayerName(match, playerName, steamId);
+    if (canonicalPlayerName) {
+      match.playersJoined[canonicalPlayerName] = true;
+      match.playerSteamIds[canonicalPlayerName] = steamId;
       updateMatchStatus(matchId, "awaiting_players", {
         playersJoined: match.playersJoined,
         playerSteamIds: match.playerSteamIds,
       });
     }
-    appendEvent(matchId, "player.joined", { playerName, steamId });
+    appendEvent(matchId, "player.joined", {
+      playerName: canonicalPlayerName || playerName,
+      sourcePlayerName: playerName,
+      steamId,
+    });
     maybePromoteLive(matchId);
     return;
   }
 
-  m = line.match(/"(.+?)<\d+><(.+?)><.*?>" switched from team <.+?> to <(CT|TERRORIST)>/);
+  m = line.match(/"(.+?)<\d+><(.+?)>(?:<.*?>)?" switched from team <.+?> to <(CT|TERRORIST)>/);
   if (m) {
     const [, playerName, steamId, team] = m;
-    if (isExpectedRealPlayer(match, playerName, steamId)) {
-      match.playerTeams[playerName] = team;
-      match.playerSteamIds[playerName] = steamId;
+    const canonicalPlayerName = getCanonicalPlayerName(match, playerName, steamId);
+    if (canonicalPlayerName) {
+      match.playerTeams[canonicalPlayerName] = team;
+      match.playerSteamIds[canonicalPlayerName] = steamId;
       updateMatchStatus(matchId, match.status, {
         playerTeams: match.playerTeams,
         playerSteamIds: match.playerSteamIds,
       });
     }
-    appendEvent(matchId, "player.team", { playerName, steamId, team });
+    appendEvent(matchId, "player.team", {
+      playerName: canonicalPlayerName || playerName,
+      sourcePlayerName: playerName,
+      steamId,
+      team,
+    });
     maybePromoteLive(matchId);
     return;
   }
 
   if (line.includes('World triggered "Round_Start"')) {
-    if (!match.startedAt && match.status === "live") {
+    if (!match.startedAt) {
       match.startedAt = nowIso();
     }
-    updateMatchStatus(matchId, match.status === "live" ? "live" : "awaiting_players", {
-      startedAt: match.startedAt || null,
+    updateMatchStatus(matchId, "live", {
+      startedAt: match.startedAt,
     });
     appendEvent(matchId, "round.start", {});
     return;
@@ -571,11 +623,29 @@ function processLine(line) {
   if (m) {
     const [, killerName, killerSteamId, killerTeam, victimName, victimSteamId, victimTeam, weapon, headshot] =
       m;
+    const canonicalKillerName = getCanonicalPlayerName(match, killerName, killerSteamId);
+    const canonicalVictimName = getCanonicalPlayerName(match, victimName, victimSteamId);
+    if (canonicalKillerName) {
+      match.playerTeams[canonicalKillerName] = killerTeam;
+      match.playerSteamIds[canonicalKillerName] = killerSteamId;
+    }
+    if (canonicalVictimName) {
+      match.playerTeams[canonicalVictimName] = victimTeam;
+      match.playerSteamIds[canonicalVictimName] = victimSteamId;
+    }
+    if (canonicalKillerName || canonicalVictimName) {
+      updateMatchStatus(matchId, "live", {
+        playerTeams: match.playerTeams,
+        playerSteamIds: match.playerSteamIds,
+      });
+    }
     appendEvent(matchId, "player.kill", {
-      killerName,
+      killerName: canonicalKillerName || killerName,
+      sourceKillerName: killerName,
       killerSteamId,
       killerTeam,
-      victimName,
+      victimName: canonicalVictimName || victimName,
+      sourceVictimName: victimName,
       victimSteamId,
       victimTeam,
       weapon,
@@ -703,20 +773,26 @@ function readRequestBody(req) {
   });
 }
 
+function normalizeCs2MapName(map) {
+  if (typeof map !== "string") return "de_dust2";
+  const normalized = map.trim().toLowerCase();
+  return normalized || "de_dust2";
+}
+
 async function handleStartMatch(req, res, slotId) {
   if (slotId !== CONFIG.slotId) {
     return notFound(res);
   }
 
   const body = await readRequestBody(req);
-  const { matchId, playerAName, playerBName, map, serverPassword, hostname, matchProfile } =
+  const { matchId, playerAName, playerBName, map, serverPassword, hostname, matchProfile, matchRules } =
     body || {};
   if (!matchId || !playerAName || !playerBName) {
     return writeJson(res, 400, { error: "matchId, playerAName, and playerBName are required" });
   }
 
   const env = loadEnvFile();
-  env.CS2_MAP = map || env.CS2_MAP || "de_dust2";
+  env.CS2_MAP = normalizeCs2MapName(map || env.CS2_MAP || "de_dust2");
   env.CS2_SERVER_PASSWORD = serverPassword || env.CS2_SERVER_PASSWORD || "safewager-demo";
   env.CS2_HOSTNAME =
     hostname || `SafeWager ${playerAName} vs ${playerBName}`.slice(0, 60).trim() || "SafeWager CS2";
@@ -724,6 +800,18 @@ async function handleStartMatch(req, res, slotId) {
     matchProfile === "solo_debug" || matchProfile === "fast_solo_debug"
       ? matchProfile
       : "duo_match";
+  env.CS2_ROUND_TARGET = String((matchRules && matchRules.roundTarget) || (env.CS2_MATCH_PROFILE === "fast_solo_debug" ? 1 : 3));
+  env.CS2_START_MONEY = String((matchRules && matchRules.startMoney) || (env.CS2_MATCH_PROFILE === "duo_match" ? 800 : 16000));
+  env.CS2_WARMUP_SECONDS = String(
+    matchRules && matchRules.warmupSeconds !== undefined && matchRules.warmupSeconds !== null
+      ? matchRules.warmupSeconds
+      : (env.CS2_MATCH_PROFILE === "duo_match" ? 60 : 15)
+  );
+  env.CS2_BOT_DIFFICULTY = String(
+    matchRules && matchRules.botDifficulty !== undefined && matchRules.botDifficulty !== null
+      ? matchRules.botDifficulty
+      : 2
+  );
   env.CS2_PLAYER_A = playerAName;
   env.CS2_PLAYER_B = playerBName;
   saveEnvFile(env);
@@ -747,6 +835,12 @@ async function handleStartMatch(req, res, slotId) {
     selectedMap: env.CS2_MAP,
     serverPassword: env.CS2_SERVER_PASSWORD,
     matchProfile: env.CS2_MATCH_PROFILE,
+    matchRules: {
+      roundTarget: Number(env.CS2_ROUND_TARGET),
+      startMoney: Number(env.CS2_START_MONEY),
+      warmupSeconds: Number(env.CS2_WARMUP_SECONDS),
+      botDifficulty: env.CS2_MATCH_PROFILE === "duo_match" ? null : Number(env.CS2_BOT_DIFFICULTY),
+    },
     status: "allocating_server",
     scoreCt: 0,
     scoreT: 0,
@@ -768,6 +862,7 @@ async function handleStartMatch(req, res, slotId) {
     playerAName,
     playerBName,
     matchProfile: env.CS2_MATCH_PROFILE,
+    matchRules: state.matches[matchId].matchRules,
   });
 
   await restartGameService();

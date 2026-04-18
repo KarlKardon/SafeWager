@@ -113,8 +113,8 @@ Repo path:
 
 Important local env in `.env`:
 
-- `DEMO_SERVER_HOST="35.238.128.180"`
-- `CS2_CONTROLLER_URL="http://35.238.128.180:8080"`
+- `DEMO_SERVER_HOST="34.72.112.234"`
+- `CS2_CONTROLLER_URL="http://34.72.112.234:8080"`
 - `CS2_CONTROLLER_TOKEN="09F0AB40-89FC-4F5B-BED4-1FEA580C10E7"`
 
 ## GCP / VM details
@@ -129,7 +129,7 @@ VM:
 - zone: `us-central1-a`
 - machine: `e2-standard-4`
 - OS: Ubuntu 22.04
-- external IP: `35.238.128.180`
+- external IP: `34.72.112.234`
 
 Disk:
 
@@ -258,19 +258,19 @@ gcloud compute ssh safewager-cs2-demo --zone=us-central1-a --command='sudo journ
 Health:
 
 ```bash
-curl -s http://35.238.128.180:8080/health
+curl -s http://34.72.112.234:8080/health
 ```
 
 List slot state:
 
 ```bash
-curl -s http://35.238.128.180:8080/slots -H 'x-controller-token: 09F0AB40-89FC-4F5B-BED4-1FEA580C10E7'
+curl -s http://34.72.112.234:8080/slots -H 'x-controller-token: 09F0AB40-89FC-4F5B-BED4-1FEA580C10E7'
 ```
 
 Start a match:
 
 ```bash
-curl -s -X POST http://35.238.128.180:8080/slots/slot_na_1/start-match \
+curl -s -X POST http://34.72.112.234:8080/slots/slot_na_1/start-match \
   -H 'Content-Type: application/json' \
   -H 'x-controller-token: 09F0AB40-89FC-4F5B-BED4-1FEA580C10E7' \
   --data '{"matchId":"test_match","playerAName":"Bryan","playerBName":"BotOpponent","map":"de_dust2","serverPassword":"testpw","hostname":"SafeWager Test","matchProfile":"fast_solo_debug"}'
@@ -279,14 +279,14 @@ curl -s -X POST http://35.238.128.180:8080/slots/slot_na_1/start-match \
 Stop current match:
 
 ```bash
-curl -s -X POST http://35.238.128.180:8080/slots/slot_na_1/stop-match \
+curl -s -X POST http://34.72.112.234:8080/slots/slot_na_1/stop-match \
   -H 'x-controller-token: 09F0AB40-89FC-4F5B-BED4-1FEA580C10E7'
 ```
 
 Fetch a match:
 
 ```bash
-curl -s http://35.238.128.180:8080/matches/fast_solo_join_3 \
+curl -s http://34.72.112.234:8080/matches/fast_solo_join_3 \
   -H 'x-controller-token: 09F0AB40-89FC-4F5B-BED4-1FEA580C10E7'
 ```
 
