@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import {
   Elements,
   PaymentElement,
@@ -340,7 +340,7 @@ function Dashboard({ user, onLogout, onDemoReset }) {
   const [createBotProfile, setCreateBotProfile] = useState("solo_debug");
   const [createRoundTarget, setCreateRoundTarget] = useState(7);
   const [createStartMoney, setCreateStartMoney] = useState(800);
-  const [createWarmupSeconds, setCreateWarmupSeconds] = useState(60);
+  const [createWarmupSeconds, setCreateWarmupSeconds] = useState(5);
   const [createBotDifficulty, setCreateBotDifficulty] = useState(2);
   const [deletingWagerId, setDeletingWagerId] = useState(null);
   const [activeWagerDetails, setActiveWagerDetails] = useState(null);
@@ -563,6 +563,91 @@ function Dashboard({ user, onLogout, onDemoReset }) {
     }
   };
 
+  const syncMatchState = useCallback(async (matchId, fallback = {}) => {
+    if (!matchId) {
+      return;
+    }
+
+    const matchResponse = await fetch(`${API_URL}/matches/${matchId}`, { credentials: "include" });
+    if (matchResponse.ok) {
+      const matchPayload = await matchResponse.json();
+      const remoteMatch = matchPayload.match;
+      const telemetry = deriveMatchTelemetry(matchPayload.events, matchPlayers.a, matchPlayers.b);
+      if (remoteMatch) {
+        setServerInfo((prev) => ({
+          ...(prev || {}),
+          matchId: remoteMatch.id,
+          name: remoteMatch.serverSlotId || fallback.slotId || prev?.name || "sw-na-slot-1",
+          status: remoteMatch.completedAt
+            ? "completed"
+            : remoteMatch.startedAt
+              ? "live"
+              : remoteMatch.status || fallback.status || prev?.status || "allocating_server",
+          map: remoteMatch.map || fallback.map || prev?.map || activeWager?.map || "de_dust2",
+          matchProfile: fallback.matchProfile || prev?.matchProfile || activeWager?.matchProfile || "duo_match",
+          serverIp: remoteMatch.serverIp || fallback.serverIp || prev?.serverIp || null,
+          serverPort: remoteMatch.serverPort || fallback.serverPort || prev?.serverPort || null,
+          serverPassword: remoteMatch.serverPassword || fallback.serverPassword || prev?.serverPassword || null,
+          joinCommand:
+            (remoteMatch.serverIp || fallback.serverIp || prev?.serverIp) &&
+            (remoteMatch.serverPort || fallback.serverPort || prev?.serverPort) &&
+            (remoteMatch.serverPassword || fallback.serverPassword || prev?.serverPassword)
+              ? `connect ${remoteMatch.serverIp || fallback.serverIp || prev?.serverIp}:${remoteMatch.serverPort || fallback.serverPort || prev?.serverPort}; password ${remoteMatch.serverPassword || fallback.serverPassword || prev?.serverPassword}`
+              : null,
+          scoreCt: telemetry.scoreCt,
+          scoreT: telemetry.scoreT,
+          playerAScore: telemetry.playerAScore,
+          playerBScore: telemetry.playerBScore,
+        }));
+      }
+    }
+
+    const resultResponse = await fetch(`${API_URL}/match-result`, { credentials: "include" });
+    const resultData = await resultResponse.json();
+    if (resultData.resolved && resultData.matchId === matchId) {
+      clearMatchPolling();
+      setResultPolling(false);
+      setMatchResult(resultData);
+      setServerInfo((prev) => prev ? { ...prev, status: "completed" } : prev);
+      updateBalance(resultData.winner, resultData.winnerBalance);
+      updateBalance(resultData.loser, resultData.loserBalance);
+      fetch(`${API_URL}/wager-result`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({ wagerId: activeWagerId, winner: resultData.winner, loser: resultData.loser }),
+      })
+        .then((response) => response.ok ? fetch(`${API_URL}/wagers`, { credentials: "include" }) : null)
+        .then((response) => response ? response.json() : null)
+        .then((wagerData) => {
+          if (wagerData) {
+            setWagers(wagerData);
+          } else {
+            setWagers((prev) => prev.filter((wager) => wager.id !== activeWagerId));
+          }
+        })
+        .catch(() => {
+          setWagers((prev) => prev.filter((wager) => wager.id !== activeWagerId));
+        });
+    }
+  }, [activeWager?.map, activeWager?.matchProfile, activeWagerId, matchPlayers.a, matchPlayers.b]);
+
+  const beginMatchPolling = useCallback((matchId, fallback = {}) => {
+    if (!matchId) {
+      return;
+    }
+    clearMatchPolling();
+    setResultPolling(true);
+    syncMatchState(matchId, fallback).catch((err) => {
+      console.error("match sync failed", err);
+    });
+    matchPollRef.current = setInterval(() => {
+      syncMatchState(matchId, fallback).catch((err) => {
+        console.error("match result polling failed", err);
+      });
+    }, 3000);
+  }, [syncMatchState]);
+
   // Can create wagers?
   const canWager = integrity?.checked && !integrity?.expired && integrity?.passed;
 
@@ -589,6 +674,80 @@ function Dashboard({ user, onLogout, onDemoReset }) {
   useEffect(() => () => clearMatchPolling(), []);
 
   useEffect(() => {
+    if (!isModalOpen || !activeWagerId || serverInfo || matchResult) {
+      return undefined;
+    }
+
+    const pollId = setInterval(() => {
+      fetchWagers();
+    }, 3000);
+
+    return () => clearInterval(pollId);
+  }, [isModalOpen, activeWagerId, serverInfo, matchResult]);
+
+  useEffect(() => {
+    if (!activeWager || activeWager.isBotMatch) {
+      return;
+    }
+
+    setMatchPlayers((prev) => ({
+      a: activeWager.creator,
+      b: activeWager.opponent || prev.b || (activeWager.creator === currentUser.name ? null : currentUser.name),
+    }));
+  }, [activeWager, currentUser.name]);
+
+  useEffect(() => {
+    if (!activeWager) {
+      return;
+    }
+
+    setLockState({
+      playerA: Boolean(activeWager.lockState?.playerA),
+      playerB: activeWager.isBotMatch ? true : Boolean(activeWager.lockState?.playerB),
+    });
+  }, [activeWager]);
+
+  useEffect(() => {
+    if (!activeWagerId) {
+      return;
+    }
+
+    const latestWager = wagers.find((wager) => wager.id === activeWagerId);
+    if (latestWager) {
+      setActiveWagerDetails(latestWager);
+    }
+  }, [wagers, activeWagerId]);
+
+  useEffect(() => {
+    if (!isModalOpen || !activeWager?.matchId || matchResult) {
+      return;
+    }
+
+    setServerInfo((prev) => prev || {
+      matchId: activeWager.matchId,
+      name: "sw-na-slot-1",
+      status: activeWager.status || "allocating_server",
+      map: activeWager.map,
+      matchProfile: activeWager.matchProfile || "duo_match",
+      serverIp: null,
+      serverPort: null,
+      serverPassword: null,
+      joinCommand: null,
+      scoreCt: null,
+      scoreT: null,
+      playerAScore: activeWager.creatorScore,
+      playerBScore: activeWager.opponentScore,
+    });
+    beginMatchPolling(activeWager.matchId, {
+      status: activeWager.status || "allocating_server",
+      map: activeWager.map,
+      matchProfile: activeWager.matchProfile || "duo_match",
+    });
+
+    return () => clearMatchPolling();
+  }, [isModalOpen, activeWager?.matchId, activeWager?.status, activeWager?.map, activeWager?.matchProfile, activeWager?.creatorScore, activeWager?.opponentScore, matchResult, beginMatchPolling]);
+
+  useEffect(() => {
     if (createOpponentType === "bot") {
       setCreateRoundTarget(createBotProfile === "fast_solo_debug" ? 1 : 3);
       setCreateStartMoney(16000);
@@ -599,7 +758,7 @@ function Dashboard({ user, onLogout, onDemoReset }) {
 
     setCreateRoundTarget(7);
     setCreateStartMoney(800);
-    setCreateWarmupSeconds(60);
+    setCreateWarmupSeconds(5);
     setCreateBotDifficulty(2);
   }, [createOpponentType, createBotProfile]);
 
@@ -708,7 +867,7 @@ function Dashboard({ user, onLogout, onDemoReset }) {
           matchRules: {
             roundTarget: createRoundTarget,
             startMoney: createStartMoney,
-            warmupSeconds: createOpponentType === "bot" ? createWarmupSeconds : 60,
+            warmupSeconds: createOpponentType === "bot" ? createWarmupSeconds : 5,
             botDifficulty: createOpponentType === "bot" ? createBotDifficulty : null,
           },
         }),
@@ -723,7 +882,7 @@ function Dashboard({ user, onLogout, onDemoReset }) {
       setCreateBotProfile("solo_debug");
       setCreateRoundTarget(7);
       setCreateStartMoney(800);
-      setCreateWarmupSeconds(60);
+      setCreateWarmupSeconds(5);
       setCreateBotDifficulty(2);
       if (data.isBotMatch) {
         openWagerModal(data);
@@ -733,40 +892,70 @@ function Dashboard({ user, onLogout, onDemoReset }) {
     }
   };
 
-  const openWagerModal = (wager) => {
+  const openWagerModal = async (wager) => {
     if (wager.id === activeWagerId && matchPlayers.a && (isPlayerA || isPlayerB)) { setIsModalOpen(true); return; }
+    let resolvedWager = wager;
     const isCreator = wager.creator === currentUser.name;
-    setActiveWagerDetails(wager);
-    setActiveWagerId(wager.id);
+
+    if (!wager.isBotMatch && !isCreator) {
+      try {
+        const response = await fetch(`${API_URL}/wagers/${wager.id}/join`, {
+          method: "POST",
+          credentials: "include",
+        });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || "failed to join wager");
+        resolvedWager = data;
+        setWagers((prev) => prev.map((entry) => entry.id === data.id ? data : entry));
+      } catch (err) {
+        setMatchError(err.message);
+        return;
+      }
+    }
+
+    setActiveWagerId(resolvedWager.id);
     setIsModalOpen(true);
     setMatchError(null); setServerInfo(null); setMatchResult(null);
     setCopiedJoinCommand(false);
-    const botMatch = Boolean(wager.isBotMatch);
-    setLockState({ playerA: false, playerB: botMatch });
+    const botMatch = Boolean(resolvedWager.isBotMatch);
+    setLockState({
+      playerA: Boolean(resolvedWager.lockState?.playerA),
+      playerB: botMatch ? true : Boolean(resolvedWager.lockState?.playerB),
+    });
     setMatchPlayers(
       botMatch
-        ? { a: wager.creator, b: wager.opponent || "BotOpponent" }
+        ? { a: resolvedWager.creator, b: resolvedWager.opponent || "BotOpponent" }
         : isCreator
-          ? { a: wager.creator, b: null }
-          : { a: wager.creator, b: currentUser.name }
+          ? { a: resolvedWager.creator, b: resolvedWager.opponent || null }
+          : { a: resolvedWager.creator, b: resolvedWager.opponent || currentUser.name }
     );
+    setActiveWagerDetails(resolvedWager);
   };
 
-  const handleLockIn = async (slot) => {
-    const isA = slot === "A";
-    const playerName = isA ? matchPlayers.a : matchPlayers.b;
-    if (activeWager?.isBotMatch && isA) {
-      setLockState((prev) => ({ ...prev, playerA: true }));
+  const handleLockIn = async () => {
+    if (!activeWagerId) {
       return;
     }
-    const amountCents = Math.round(parseFloat(activeWager.amount.replace("$", "")) * 100);
+
     try {
-      const r = await fetch(`${API_URL}/lock-wager`, { method: "POST", headers: { "Content-Type": "application/json" }, credentials: "include", body: JSON.stringify({ username: playerName, amount: amountCents }) });
+      const r = await fetch(`${API_URL}/wagers/${activeWagerId}/lock`, {
+        method: "POST",
+        credentials: "include",
+      });
       const data = await r.json();
-      if (!r.ok) throw new Error(data.error);
-      updateBalance(playerName, data.balance);
-      setLockState((prev) => ({ ...prev, [isA ? "playerA" : "playerB"]: true }));
-    } catch (err) { setMatchError(err.message); }
+      if (!r.ok) throw new Error(data.error || "Failed to lock wager");
+      updateBalance(currentUser.name, data.balance);
+      if (data.wager) {
+        setWagers((prev) => prev.map((entry) => entry.id === data.wager.id ? data.wager : entry));
+        setActiveWagerDetails(data.wager);
+        setLockState({
+          playerA: Boolean(data.wager.lockState?.playerA),
+          playerB: data.wager.isBotMatch ? true : Boolean(data.wager.lockState?.playerB),
+        });
+      }
+    } catch (err) {
+      setMatchError(err.message);
+    }
   };
 
   const finalizeMatch = async () => {
@@ -810,74 +999,15 @@ function Dashboard({ user, onLogout, onDemoReset }) {
         playerAScore: null,
         playerBScore: null,
       });
-      setResultPolling(true);
-      matchPollRef.current = setInterval(async () => {
-        try {
-          if (data.matchId) {
-            const matchResponse = await fetch(`${API_URL}/matches/${data.matchId}`, { credentials: "include" });
-            if (matchResponse.ok) {
-              const matchPayload = await matchResponse.json();
-              const remoteMatch = matchPayload.match;
-              const telemetry = deriveMatchTelemetry(matchPayload.events, matchPlayers.a, matchPlayers.b);
-              if (remoteMatch) {
-                setServerInfo((prev) => prev ? ({
-                  ...prev,
-                  matchId: remoteMatch.id,
-                  status: remoteMatch.completedAt
-                    ? "completed"
-                    : remoteMatch.startedAt
-                      ? "live"
-                      : remoteMatch.status || prev.status,
-                  serverIp: remoteMatch.serverIp || prev.serverIp,
-                  serverPort: remoteMatch.serverPort || prev.serverPort,
-                  serverPassword: remoteMatch.serverPassword || prev.serverPassword,
-                  joinCommand:
-                    (remoteMatch.serverIp || prev.serverIp) &&
-                    (remoteMatch.serverPort || prev.serverPort) &&
-                    (remoteMatch.serverPassword || prev.serverPassword)
-                      ? `connect ${remoteMatch.serverIp || prev.serverIp}:${remoteMatch.serverPort || prev.serverPort}; password ${remoteMatch.serverPassword || prev.serverPassword}`
-                      : prev.joinCommand || null,
-                  scoreCt: telemetry.scoreCt,
-                  scoreT: telemetry.scoreT,
-                  playerAScore: telemetry.playerAScore,
-                  playerBScore: telemetry.playerBScore,
-                }) : prev);
-              }
-            }
-          }
-          const r2 = await fetch(`${API_URL}/match-result`, { credentials: "include" });
-          const resultData = await r2.json();
-          if (resultData.resolved) {
-            clearMatchPolling();
-            setResultPolling(false);
-            setMatchResult(resultData);
-            setServerInfo((prev) => prev ? { ...prev, status: "completed" } : prev);
-            updateBalance(resultData.winner, resultData.winnerBalance);
-            updateBalance(resultData.loser, resultData.loserBalance);
-            // Record result
-            fetch(`${API_URL}/wager-result`, {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              credentials: "include",
-              body: JSON.stringify({ wagerId: activeWagerId, winner: resultData.winner, loser: resultData.loser }),
-            })
-              .then((response) => response.ok ? fetch(`${API_URL}/wagers`, { credentials: "include" }) : null)
-              .then((response) => response ? response.json() : null)
-              .then((wagerData) => {
-                if (wagerData) {
-                  setWagers(wagerData);
-                } else {
-                  setWagers((prev) => prev.filter((wager) => wager.id !== activeWagerId));
-                }
-              })
-              .catch(() => {
-                setWagers((prev) => prev.filter((wager) => wager.id !== activeWagerId));
-              });
-          }
-        } catch (err) {
-          console.error("match result polling failed", err);
-        }
-      }, 3000);
+      beginMatchPolling(data.matchId, {
+        slotId: data.slotId || "sw-na-slot-1",
+        status: data.status || "allocating_server",
+        map: activeWager?.map || "de_dust2",
+        matchProfile: activeWager?.matchProfile || "duo_match",
+        serverIp: data.serverIp,
+        serverPort: data.serverPort,
+        serverPassword: data.serverPassword,
+      });
     } catch (err) {
       clearMatchPolling();
       setServerInfo(null);
@@ -1241,7 +1371,7 @@ function Dashboard({ user, onLogout, onDemoReset }) {
                 <div className="preview-row"><span className="muted">Rules</span><span>{formatRulesSummary({
                   roundTarget: createRoundTarget,
                   startMoney: createStartMoney,
-                  warmupSeconds: createOpponentType === "bot" ? createWarmupSeconds : 60,
+                  warmupSeconds: createOpponentType === "bot" ? createWarmupSeconds : 5,
                   botDifficulty: createOpponentType === "bot" ? createBotDifficulty : null,
                 }, createOpponentType === "bot")}</span></div>
                 <div className="preview-row"><span className="muted">Map</span><span>{createMap}</span></div>
@@ -1292,7 +1422,8 @@ function Dashboard({ user, onLogout, onDemoReset }) {
                       <div>
                         <h3 className="text-success">Match Confirmed</h3>
                         <p className="muted">Both players' wagers are locked.</p>
-                        {!serverInfo && <button className="btn primary" onClick={finalizeMatch}>Provision Server</button>}
+                        {!serverInfo && isPlayerA && <button className="btn primary" onClick={finalizeMatch}>Provision Server</button>}
+                        {!serverInfo && isPlayerB && <p className="muted">Waiting for the wager creator to provision the server.</p>}
                       </div>
                     </div>
                   )}

@@ -30,6 +30,8 @@ db.exec(`
     match_id TEXT,
     winner_name TEXT,
     loser_name TEXT,
+    creator_locked_at TEXT,
+    opponent_locked_at TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
   );
@@ -102,6 +104,12 @@ if (!wagerColumns.some((column) => column.name === "opponent_avatar")) {
 }
 if (!wagerColumns.some((column) => column.name === "match_rules_json")) {
   db.exec("ALTER TABLE wagers ADD COLUMN match_rules_json TEXT");
+}
+if (!wagerColumns.some((column) => column.name === "creator_locked_at")) {
+  db.exec("ALTER TABLE wagers ADD COLUMN creator_locked_at TEXT");
+}
+if (!wagerColumns.some((column) => column.name === "opponent_locked_at")) {
+  db.exec("ALTER TABLE wagers ADD COLUMN opponent_locked_at TEXT");
 }
 
 const serverEventColumns = db.prepare("PRAGMA table_info(server_events)").all();

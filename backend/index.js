@@ -194,7 +194,7 @@ function getDefaultMatchRules({ wagerType, matchProfile }) {
   return {
     roundTarget: 7,
     startMoney: 800,
-    warmupSeconds: 60,
+    warmupSeconds: 5,
     botDifficulty: null,
   };
 }
@@ -245,6 +245,10 @@ function serializeWager(row) {
     amount: formatCurrency(row.amount_cents),
     map: row.map,
     status: row.status,
+    lockState: {
+      playerA: Boolean(row.creator_locked_at),
+      playerB: Boolean(row.opponent_locked_at),
+    },
     creatorScore: matchSummary?.playerOneScore ?? null,
     opponentScore: matchSummary?.playerTwoScore ?? null,
     result:
@@ -614,6 +618,71 @@ app.post("/lock-wager", (req, res) => {
   res.json({ balance: getBalance(username) });
 });
 
+app.post("/wagers/:wagerId/lock", (req, res) => {
+  if (!req.isAuthenticated()) {
+    return res.status(401).json({ error: "not authenticated" });
+  }
+
+  const wager = db.prepare("SELECT * FROM wagers WHERE id = ?").get(req.params.wagerId);
+  if (!wager) {
+    return res.status(404).json({ error: "wager not found" });
+  }
+  if (!["open", "allocating_server", "server_ready", "awaiting_players", "live"].includes(wager.status)) {
+    return res.status(400).json({ error: "wager is not lockable" });
+  }
+
+  const userSteamId = req.user.steamId;
+  const userName = req.user.username;
+  const amount = wager.amount_cents;
+  const isCreator = wager.creator_steam_id === userSteamId;
+  const isOpponent = wager.opponent_steam_id === userSteamId;
+
+  if (!isCreator && !isOpponent) {
+    return res.status(403).json({ error: "not authorized for this wager" });
+  }
+
+  const alreadyLocked = isCreator ? Boolean(wager.creator_locked_at) : Boolean(wager.opponent_locked_at);
+  if (alreadyLocked) {
+    return res.json({
+      balance: getBalance(userName),
+      wager: serializeWager(wager),
+    });
+  }
+
+  const balance = getBalance(userName);
+  if (balance < amount) {
+    return res.status(400).json({ error: "Insufficient balance" });
+  }
+
+  deductBalance(userName, amount);
+  const lockedAt = nowIso();
+  db.prepare(`
+    UPDATE wagers
+    SET creator_locked_at = COALESCE(creator_locked_at, ?),
+        opponent_locked_at = COALESCE(opponent_locked_at, ?),
+        updated_at = ?
+    WHERE id = ?
+  `).run(
+    isCreator ? lockedAt : null,
+    isOpponent ? lockedAt : null,
+    lockedAt,
+    wager.id
+  );
+
+  const updatedWager = db.prepare("SELECT * FROM wagers WHERE id = ?").get(wager.id);
+  console.log("[wager] locked", {
+    wagerId: wager.id,
+    username: userName,
+    role: isCreator ? "creator" : "opponent",
+    amount,
+    balance: getBalance(userName),
+  });
+  res.json({
+    balance: getBalance(userName),
+    wager: serializeWager(updatedWager),
+  });
+});
+
 // ── Match server management ──
 
 let activeMatchId = null;
@@ -897,8 +966,39 @@ async function syncControllerSlots() {
 
 // Store match data and either call the VM controller or fall back to the local mock server.
 app.post("/start-match-server", async (req, res) => {
+  if (!req.isAuthenticated()) {
+    return res.status(401).json({ error: "not authenticated" });
+  }
+
   const { playerAName, playerBName, wagerAmount, map, wagerId, matchProfile, matchRules } = req.body || {};
   const wagerRecord = wagerId ? db.prepare("SELECT * FROM wagers WHERE id = ?").get(wagerId) : null;
+  if (!wagerRecord) {
+    return res.status(404).json({ error: "wager not found" });
+  }
+  if (wagerRecord.creator_steam_id !== req.user.steamId) {
+    return res.status(403).json({ error: "only the wager creator can provision the server" });
+  }
+
+  const existingMatch = wagerRecord.match_id
+    ? db.prepare("SELECT * FROM matches WHERE id = ?").get(wagerRecord.match_id)
+    : null;
+  if (existingMatch) {
+    return res.json({
+      ok: true,
+      matchId: existingMatch.id,
+      status: existingMatch.completed_at
+        ? "completed"
+        : existingMatch.started_at
+          ? "live"
+          : existingMatch.status || "allocating_server",
+      map: existingMatch.selected_map,
+      serverIp: existingMatch.server_ip,
+      serverPort: existingMatch.server_port,
+      serverPassword: existingMatch.server_password,
+      slotId: existingMatch.server_slot_id,
+    });
+  }
+
   const wagerProfile = wagerRecord?.match_profile || null;
   const wagerType = wagerRecord?.wager_type || "pvp";
   const storedMatchRules = parseJsonSafely(wagerRecord?.match_rules_json, null);
@@ -914,10 +1014,11 @@ app.post("/start-match-server", async (req, res) => {
     resolvedMatchProfile === "duo_match"
       ? playerBName
       : playerBName || wagerRecord?.opponent_username || "BotOpponent";
+  const resolvedCreatorSteamId = wagerRecord?.creator_steam_id || req.user?.steamId || null;
   const resolvedOpponentSteamId =
-    wagerType === "bot_debug" ? null : (req.user && req.user.steamId) || wagerRecord?.opponent_steam_id || null;
+    wagerType === "bot_debug" ? null : wagerRecord?.opponent_steam_id || null;
   const resolvedOpponentAvatar =
-    wagerType === "bot_debug" ? null : (req.user && req.user.avatar) || wagerRecord?.opponent_avatar || null;
+    wagerType === "bot_debug" ? null : wagerRecord?.opponent_avatar || null;
   const resolvedMatchRules = normalizeMatchRules(matchRules || storedMatchRules, {
     wagerType,
     matchProfile: resolvedMatchProfile,
@@ -954,9 +1055,9 @@ app.post("/start-match-server", async (req, res) => {
       matchId,
       validWagerId,
       playerAName,
-      null,
+      resolvedCreatorSteamId,
       resolvedPlayerBName,
-      req.user?.steamId || null,
+      resolvedOpponentSteamId,
       "allocating_server",
       map || "de_dust2",
       "NA",
@@ -1345,6 +1446,43 @@ app.get("/wagers", (req, res) => {
     ORDER BY created_at DESC
   `).all(req.user?.steamId || "");
   res.json(rows.map(serializeWager));
+});
+
+app.post("/wagers/:wagerId/join", (req, res) => {
+  if (!req.isAuthenticated()) {
+    return res.status(401).json({ error: "not authenticated" });
+  }
+
+  const wager = db.prepare("SELECT * FROM wagers WHERE id = ?").get(req.params.wagerId);
+  if (!wager) {
+    return res.status(404).json({ error: "wager not found" });
+  }
+  if (wager.wager_type === "bot_debug") {
+    return res.status(400).json({ error: "bot debug wagers cannot be joined" });
+  }
+  if (!["open", "allocating_server", "server_ready", "awaiting_players", "live"].includes(wager.status)) {
+    return res.status(400).json({ error: "wager is not joinable" });
+  }
+  if (wager.creator_steam_id === req.user.steamId) {
+    return res.json(serializeWager(wager));
+  }
+  if (wager.opponent_steam_id && wager.opponent_steam_id !== req.user.steamId) {
+    return res.status(409).json({ error: "wager already has a challenger" });
+  }
+
+  db.prepare(`
+    UPDATE wagers
+    SET opponent_username = ?, opponent_steam_id = ?, opponent_avatar = ?, updated_at = ?
+    WHERE id = ?
+  `).run(
+    req.user.username,
+    req.user.steamId,
+    req.user.avatar || null,
+    nowIso(),
+    wager.id
+  );
+
+  res.json(serializeWager(db.prepare("SELECT * FROM wagers WHERE id = ?").get(wager.id)));
 });
 
 app.delete("/wagers/:wagerId", async (req, res) => {
